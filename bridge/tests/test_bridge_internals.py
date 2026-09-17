@@ -307,7 +307,7 @@ class CodexDeliveryStartupTests(unittest.TestCase):
                             client,
                             "thread-tui",
                             os.getcwd(),
-                            "%9",
+                            self.bridge.CodexPane("%9"),
                             5,
                             startup_log,
                         )
@@ -421,6 +421,113 @@ class CodexDeliveryStartupTests(unittest.TestCase):
             )
 
 
+def mcp_startup(name, status):
+    return {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {"threadId": "thread-headless", "name": name, "status": status},
+    }
+
+
+class HeadlessStartupTests(unittest.TestCase):
+    """A headless thread's MCP startup, told to the Bridge's own connection.
+
+    Measured against codex-cli 0.154.0: some of a new thread's startup
+    notifications arrive before `thread/start` answers and some after it, so
+    the connection has to record both and keep listening between requests.
+    """
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        # A Unix socket path has a short length limit; the default temporary
+        # directory on macOS is already most of it.
+        self.work = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(self.work.cleanup)
+        self.root = pathlib.Path(self.work.name)
+        self.requests = []
+
+    async def handle(self, request):
+        from aiohttp import web
+
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        async for message in websocket:
+            payload = json.loads(message.data)
+            if "id" not in payload:
+                continue
+            self.requests.append((payload["method"], payload["params"]))
+            if payload["method"] == "thread/start":
+                await websocket.send_json(mcp_startup("graph", "starting"))
+                await websocket.send_json(
+                    {"id": payload["id"], "result": {"thread": {"id": "thread-headless"}}}
+                )
+                await websocket.send_json(mcp_startup("search", "ready"))
+            elif payload["method"] == "config/read":
+                await websocket.send_json({
+                    "id": payload["id"],
+                    "result": {
+                        "config": {"mcp_servers": {"graph": {}, "search": {}}}
+                    },
+                })
+                # Past every request the Bridge makes, so only listening hears it.
+                await asyncio.sleep(0.05)
+                await websocket.send_json(mcp_startup("graph", "ready"))
+            else:
+                await websocket.send_json({"id": payload["id"], "result": {}})
+        return websocket
+
+    async def start_the_thread_and_wait(self):
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_get("/", self.handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        socket_path = self.root / "app-server.sock"
+        await web.UnixSite(runner, str(socket_path)).start()
+        try:
+            reviewer = self.bridge.CodexAppServer(4242, self.root)
+            args = base_args(cwd=str(self.root), sandbox="read-only")
+            client = await self.bridge.connect_when_ready(
+                socket_path, reviewer, 2, self.root / "app-server.log"
+            )
+            try:
+                thread_id = await reviewer.load_thread(client, args)
+                statuses = await self.bridge.wait_for_mcp_startup(
+                    client,
+                    thread_id,
+                    args.cwd,
+                    reviewer,
+                    2,
+                    self.root / self.bridge.MCP_STARTUP_LOG_FILENAME,
+                )
+            finally:
+                await client.__aexit__(None, None, None)
+        finally:
+            await runner.cleanup()
+        return thread_id, statuses
+
+    def test_startup_told_before_and_after_the_thread_starts_is_all_recorded(self):
+        with mock.patch.object(self.bridge, "app_server_alive", return_value=True):
+            thread_id, statuses = asyncio.run(self.start_the_thread_and_wait())
+
+        self.assertEqual(thread_id, "thread-headless")
+        self.assertEqual(
+            {name: status["status"] for name, status in statuses.items()},
+            {"graph": "ready", "search": "ready"},
+        )
+        self.assertIn(
+            (
+                "thread/start",
+                {
+                    "cwd": str(self.root),
+                    "sandbox": "read-only",
+                    "approvalPolicy": "never",
+                },
+            ),
+            self.requests,
+        )
+
+
 class RecoveryDeliveryTests(unittest.TestCase):
     def setUp(self):
         self.bridge = load_bridge()
@@ -437,7 +544,7 @@ class RecoveryDeliveryTests(unittest.TestCase):
                     client,
                     self.state,
                     "Review the recorded scope",
-                    "%9",
+                    self.bridge.CodexPane("%9"),
                     1,
                 )
             )
@@ -605,7 +712,10 @@ class WaitForReviewTests(unittest.TestCase):
         client = FlakyClient()
         with mock.patch.object(self.bridge, "pane_exists", return_value=True):
             thread, turn = asyncio.run(
-                self.bridge.wait_for_review(client, "thread-1", self.marker, "%9", 10)
+                self.bridge.wait_for_review(
+                    client, "thread-1", self.marker,
+                    self.bridge.CodexPane("%9"), 10,
+                )
             )
 
         self.assertEqual(client.reads, 2)
@@ -622,7 +732,8 @@ class WaitForReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "never became readable"):
                 asyncio.run(
                     self.bridge.wait_for_review(
-                        DeadClient(), "thread-1", self.marker, "%9", 1
+                        DeadClient(), "thread-1", self.marker,
+                        self.bridge.CodexPane("%9"), 1,
                     )
                 )
 

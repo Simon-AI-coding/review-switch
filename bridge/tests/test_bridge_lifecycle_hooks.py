@@ -485,6 +485,20 @@ class LifecycleHookTests(HookRecordingTestCase):
             record["REVIEW_CHILD_TMUX_TARGET"], self.codex.launched_panes[0]
         )
 
+    def test_a_background_child_launch_names_no_pane(self):
+        self.without_tmux()
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.events(), ["review-start", "child-launch", "axis-end", "review-end"]
+        )
+        record = self.firings_at("child-launch")[0]
+        self.assertEqual(record["REVIEW_CHILD_CWD"], str(self.worktree))
+        self.assertEqual(record["REVIEW_CHILD_TMUX_TARGET"], "")
+
     def test_the_review_start_hook_names_the_reviewer_the_model_and_the_axes(self):
         self.codex.finish("no findings")
 

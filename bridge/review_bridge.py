@@ -12,8 +12,9 @@ available.
 Preparation and delivery are separate: preparation fills one Axis Brief per
 requested axis, and the Lane `--reviewer` names takes one brief and gives back
 that axis's result. A reviewer this bridge has no Lane for is refused by name
-before any of it opens. `codex` drives an interactive TUI lineage in a tmux pane
-of its own; `claude` drives a headless process and needs no tmux (ADR-0003).
+before any of it opens. `codex` drives a TUI lineage in a tmux pane of its own
+where the call has a tmux window, and a headless app-server where it has none;
+`claude` drives a headless process either way (ADR-0003).
 
 A caller that wants a review's start, each axis's cost, and its end observed
 hands in the commands to run at those points, and gets them run with this
@@ -71,6 +72,12 @@ NO_LIVE_SESSION_EXIT = 3
 # lineage was pinned to, so the reviewer names the vendor and nothing else.
 REVIEWER_CODEX = "codex"
 REVIEWER_CLAUDE = "claude"
+# The record field naming the Lane a session belongs to. A headless codex
+# review and a claude review share an owner, so the owner alone cannot keep
+# one Lane from adopting the other's records.
+RECORD_REVIEWER_FIELD = "reviewer"
+# How long a stopped headless app-server has to exit before it is killed.
+APP_SERVER_STOP_SECONDS = 3
 CODE_GRAPH_CLI = "code-review-graph"
 # The tool's own "put the graph somewhere else" variable, which the Bridge
 # takes out of the environment it hands the CLI. One data directory holds one
@@ -593,11 +600,24 @@ def tmux_server_identity(value):
     return f"{parts[0]},{parts[1]}"
 
 
+def has_tmux_window(args, environment=None):
+    """Whether this call has a tmux window to open a reviewer in.
+
+    A window is a tmux server and the pane this call came from; `TMUX` without
+    that pane is no window at all. This is the one place that asks.
+    """
+    environment = os.environ if environment is None else environment
+    return bool(
+        environment.get("TMUX")
+        and (args.tmux_target or environment.get("TMUX_PANE"))
+    )
+
+
 def resolve_owner(args, environment=None):
     environment = os.environ if environment is None else environment
     tmux_value = environment.get("TMUX")
     origin_pane = args.tmux_target or environment.get("TMUX_PANE")
-    if not tmux_value or not origin_pane:
+    if not has_tmux_window(args, environment):
         raise RuntimeError(
             "Claude Code must run inside tmux with an originating tmux pane"
         )
@@ -611,11 +631,14 @@ def resolve_owner(args, environment=None):
 def lane_owner(args, lane):
     """The identity this call's sessions belong to, tmux half filled or not.
 
-    The tuple is the Bridge's and every Lane is keyed by it. A Lane with no
-    window has no tmux half to fill, which is also what keeps a headless Lane's
-    records and a codex Lane's from ever matching each other's owner.
+    The tuple is the Bridge's and every Lane is keyed by it. The tmux half is
+    filled only where the reviewer opens in a pane: its Lane supports one and
+    this call has a window to open it in. Every other reviewer runs headless
+    and belongs to the worktree alone, so a pane review and a headless one
+    never match each other's owner, and a Lane reads which delivery it has
+    from the owner it was given rather than asking tmux itself.
     """
-    if lane.NEEDS_TMUX:
+    if lane.SUPPORTS_PANE and has_tmux_window(args):
         return resolve_owner(args)
     return InvocationOwner(
         tmux_server="",
@@ -624,10 +647,27 @@ def lane_owner(args, lane):
     )
 
 
-def validate_session_owner(state, owner):
+def record_reviewer(state):
+    """The Lane a record belongs to.
+
+    A record written before records named their Lane is told apart by the
+    lineage handle only a claude record carries.
+    """
+    reviewer = state.get(RECORD_REVIEWER_FIELD)
+    if reviewer:
+        return reviewer
+    return REVIEWER_CLAUDE if "claudeSessionId" in state else REVIEWER_CODEX
+
+
+def validate_session_owner(state, owner, reviewer):
     if state.get("owner") != owner.to_dict():
         raise RuntimeError(
             "Review session belongs to another tmux pane or Git worktree"
+        )
+    if record_reviewer(state) != reviewer:
+        raise RuntimeError(
+            "Review session belongs to another reviewer: "
+            f"{record_reviewer(state)}"
         )
 
 
@@ -765,8 +805,8 @@ class SessionStore:
         """Take back a record whose review never began; missing is already done."""
         self.state_path(session_id).unlink(missing_ok=True)
 
-    def find_by_owner(self, owner, required=()):
-        """Returns every record this owner wrote carrying `required`, newest first.
+    def find_by_owner(self, owner, reviewer, required=()):
+        """Returns every record this owner's `reviewer` wrote carrying `required`, newest first.
 
         The record is written before the review is awaited, so a session whose
         driver died mid-review is already on disk under the same owner tuple the
@@ -787,6 +827,8 @@ class SessionStore:
             if state.get("version") != SESSION_STATE_VERSION:
                 continue
             if state.get("owner") != owner.to_dict():
+                continue
+            if record_reviewer(state) != reviewer:
                 continue
             if any(not state.get(field) for field in required):
                 continue
@@ -849,8 +891,11 @@ def owner_lock(store, owner, resuming=None):
 
 
 class AppServerClient:
-    def __init__(self, socket_path):
+    def __init__(self, socket_path, notification_log=None):
         self.socket_path = socket_path
+        # Where this connection records the MCP startup it is told about. Only
+        # a connection with no TUI in front of it is told anything worth it.
+        self.notification_log = notification_log
         self.next_id = 1
 
     async def __aenter__(self):
@@ -912,8 +957,34 @@ class AppServerClient:
 
             await self._handle_unsolicited(payload)
 
+    async def pump(self, seconds):
+        """Read whatever the server volunteers for a while; returns nothing.
+
+        Notifications only arrive while someone is reading the socket, and the
+        MCP startup wait has no request of its own to wait on, so it needs a
+        way to listen without asking anything.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                message = await asyncio.wait_for(
+                    self.websocket.receive(), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                return
+            if message.type != aiohttp.WSMsgType.TEXT:
+                raise AppServerError(
+                    f"Unexpected app-server WebSocket message type: {message.type}"
+                )
+            await self._handle_unsolicited(json.loads(message.data))
+
     async def _handle_unsolicited(self, payload):
-        """Decline a server request; ordinary notifications need no response."""
+        """Record MCP startup where asked to, and decline a server request."""
+        if self.notification_log is not None:
+            record_mcp_startup_notification(self.notification_log, payload)
         if payload.get("id") is not None and payload.get("method"):
             await self.websocket.send_json(
                 {
@@ -930,7 +1001,7 @@ class AppServerClient:
 
 
 def record_mcp_startup_notification(path, payload):
-    """Append one thread-scoped MCP transition observed on the TUI connection."""
+    """Append one thread-scoped MCP transition a reviewer's connection observed."""
     if payload.get("method") != MCP_STARTUP_NOTIFICATION:
         return
     params = payload.get("params") or {}
@@ -2620,7 +2691,7 @@ def refuse_resume_past_cap(args, owner, store):
     if args.recover_session or not args.resume_session:
         return None
     state = args.resume_state or store.read(args.resume_session)
-    validate_session_owner(state, owner)
+    validate_session_owner(state, owner, args.reviewer)
     return refusal_for(state)
 
 
@@ -2648,7 +2719,7 @@ def grant_round(args, owner, store):
     Returns the record the Lane resumes, and the refusal that it may not.
     """
     state = store.read(args.resume_session)
-    validate_session_owner(state, owner)
+    validate_session_owner(state, owner, args.reviewer)
     refusal = refusal_for(state)
     if refusal is not None:
         return state, refusal
@@ -2866,24 +2937,8 @@ def run_pane(args):
     startup_log_path = runtime_dir / MCP_STARTUP_LOG_FILENAME
     log_path = runtime_dir / "app-server.log"
     log_file = log_path.open("a", encoding="utf-8")
-    app_server_command = [
-        "codex",
-        "app-server",
-        "--listen",
-        f"unix://{socket_path}",
-    ]
-    if args.network:
-        app_server_command.extend(
-            [
-                "-c",
-                "sandbox_workspace_write.network_access=true",
-                "-c",
-                'web_search="live"',
-            ]
-        )
-    app_server_command.extend(model_config_overrides(args))
     app_server = subprocess.Popen(
-        app_server_command,
+        app_server_command(args, socket_path),
         cwd=args.cwd,
         stdout=log_file,
         stderr=subprocess.STDOUT,
@@ -2952,6 +3007,110 @@ def run_pane(args):
         return subprocess.run(command, cwd=args.cwd, check=False).returncode
     finally:
         cleanup()
+
+
+def app_server_command(args, socket_path):
+    """The app-server a reviewer runs on, pane or headless alike.
+
+    Model and network are pinned here rather than on the thread, because a
+    resumed thread may carry no override of its own (`build_tui_command`).
+    """
+    command = ["codex", "app-server", "--listen", f"unix://{socket_path}"]
+    if args.network:
+        command.extend(
+            [
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "-c",
+                'web_search="live"',
+            ]
+        )
+    command.extend(model_config_overrides(args))
+    return command
+
+
+def launch_app_server(args, runtime_dir):
+    """Start this axis's headless app-server, in a session of its own.
+
+    A session of its own lets it outlive a driver that dies, which is what
+    makes a headless codex review recoverable, as a claude reviewer is.
+    """
+    runtime_dir = pathlib.Path(runtime_dir)
+    try:
+        with open(runtime_dir / "app-server.log", "ab") as log:
+            return subprocess.Popen(
+                app_server_command(args, runtime_dir / "app-server.sock"),
+                cwd=args.cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot launch a headless Codex app-server: {error}"
+        ) from error
+
+
+def process_command(pid):
+    """The command line a pid is running now, empty where there is none.
+
+    `None` where this caller cannot ask: a sandbox may refuse `ps` outright.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def app_server_alive(pid, socket_path):
+    """True while the headless app-server on `socket_path` still runs as `pid`.
+
+    A record keeps its pid after the app-server is gone, and the system may
+    since have given that pid to anything else. The runtime socket is unique to
+    this reviewer, so a process whose command line does not name it is not
+    this reviewer, whatever its pid. A caller that cannot read command lines
+    has only the pid to go on, as it had before the check existed. The Bridge
+    that started it also reaps it here, because an exited child it never
+    waited on still answers to its pid.
+    """
+    try:
+        reaped, _status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        reaped = 0
+    if reaped or not process_exists(pid):
+        return False
+    command = process_command(pid)
+    return command is None or f"unix://{socket_path}" in command
+
+
+def terminate_app_server(pid, socket_path):
+    """Stop an app-server and every MCP server it started, and fail at nothing.
+
+    It leads a session of its own, so its pid names that whole process group.
+    Nothing is signalled unless that pid is still this reviewer.
+    """
+    if not app_server_alive(pid, socket_path):
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + APP_SERVER_STOP_SECONDS
+    while time.monotonic() < deadline:
+        if not app_server_alive(pid, socket_path):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        return
 
 
 def build_tui_command(args, socket_path, thread_id=None):
@@ -3072,6 +3231,129 @@ def open_child_pane(args, runtime_dir):
     return pane_id
 
 
+class CodexPane:
+    """Pane delivery: a Codex TUI in a tmux split of the caller's own window.
+
+    The TUI creates or resumes the thread and a proxy in front of it records
+    MCP startup, so the Bridge only waits for both.
+    """
+
+    description = "Codex TUI pane"
+    notification_log = None
+
+    def __init__(self, pane_id):
+        self.pane_id = pane_id
+
+    @classmethod
+    def open(cls, args, runtime_dir, owner, after=None):
+        """Split off the caller's own pane, or below the axis opened before."""
+        args.tmux_target = after.pane_id if after else owner.origin_pane
+        args.split_direction = "vertical" if after else "horizontal"
+        return cls(open_child_pane(args, runtime_dir))
+
+    @classmethod
+    def from_record(cls, state):
+        return cls(state.get("paneId"))
+
+    def record_fields(self):
+        return {"paneId": self.pane_id}
+
+    def alive(self):
+        return pane_exists(self.pane_id)
+
+    async def listen(self, _client, seconds):
+        await asyncio.sleep(seconds)
+
+    async def load_thread(self, client, args, thread_id=None):
+        return await wait_for_tui_thread(
+            client, thread_id, self.pane_id, args.startup_timeout
+        )
+
+    def stop(self, runtime_dir):
+        cleanup_pane(self.pane_id, runtime_dir)
+
+
+class CodexAppServer:
+    """Headless delivery: a detached app-server the Bridge drives itself.
+
+    No TUI is attached, so the Bridge starts or resumes the thread, and the
+    MCP startup a proxy would have recorded arrives on the Bridge's own
+    connection instead.
+    """
+
+    description = "Codex app-server"
+
+    def __init__(self, pid, runtime_dir):
+        self.pid = pid
+        runtime_dir = pathlib.Path(runtime_dir) if runtime_dir else None
+        self.socket_path = (
+            runtime_dir / "app-server.sock" if runtime_dir else None
+        )
+        self.notification_log = (
+            runtime_dir / MCP_STARTUP_LOG_FILENAME if runtime_dir else None
+        )
+
+    @classmethod
+    def open(cls, args, runtime_dir, _owner, _after=None):
+        process = launch_app_server(args, runtime_dir)
+        hook_child_launch(args)
+        return cls(process.pid, runtime_dir)
+
+    @classmethod
+    def from_record(cls, state):
+        return cls(state.get("appServerPid"), state.get("runtimeDir"))
+
+    def record_fields(self):
+        return {"appServerPid": self.pid}
+
+    def alive(self):
+        return bool(self.pid and self.socket_path) and app_server_alive(
+            self.pid, self.socket_path
+        )
+
+    async def listen(self, client, seconds):
+        await client.pump(seconds)
+
+    async def load_thread(self, client, args, thread_id=None):
+        """Start this axis's thread, or resume the one its lineage names.
+
+        A new thread takes the caller's sandbox and approval. A resume carries
+        no override, as a pane's does, and the app-server already carries the
+        model and network the lineage runs on.
+        """
+        if thread_id:
+            method, params = "thread/resume", {"threadId": thread_id}
+        else:
+            method, params = "thread/start", {
+                "cwd": args.cwd,
+                "sandbox": args.sandbox,
+                "approvalPolicy": args.approval,
+            }
+        try:
+            result = await asyncio.wait_for(
+                client.request(method, params), timeout=args.startup_timeout
+            )
+        except asyncio.TimeoutError as error:
+            raise RuntimeError(f"Timed out waiting for Codex {method}") from error
+        return thread_id or result["thread"]["id"]
+
+    def stop(self, runtime_dir):
+        if self.pid and self.socket_path:
+            terminate_app_server(self.pid, self.socket_path)
+        if runtime_dir:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def reviewer_gone(reviewer):
+    """Whether a reviewer this wait watches has exited; `None` watches nothing."""
+    return reviewer is not None and not reviewer.alive()
+
+
+def open_app_server_client(socket_path, notification_log=None):
+    """One connected client, or the error that the socket would not take one."""
+    return AppServerClient(socket_path, notification_log).__aenter__()
+
+
 def user_message_text(item):
     if item.get("type") != "userMessage":
         return ""
@@ -3107,20 +3389,21 @@ def final_agent_message(turn):
     return fallback[-1] if fallback else ""
 
 
-async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
+async def connect_when_ready(socket_path, reviewer, timeout_seconds, log_path):
     deadline = time.monotonic() + timeout_seconds
     last_error = None
     while time.monotonic() < deadline:
-        if not pane_exists(pane_id):
+        if reviewer_gone(reviewer):
             detail = read_log_tail(log_path)
             raise RuntimeError(
-                "Codex TUI pane exited during startup"
+                f"{reviewer.description} exited during startup"
                 + (f": {detail}" if detail else "")
             )
         if os.path.exists(socket_path):
             try:
-                client = AppServerClient(socket_path)
-                return await client.__aenter__()
+                return await open_app_server_client(
+                    socket_path, reviewer.notification_log
+                )
             except (OSError, aiohttp.ClientError, AppServerError) as error:
                 last_error = error
         await asyncio.sleep(0.1)
@@ -3164,12 +3447,14 @@ async def wait_for_tui_thread(client, expected_thread_id, pane_id, timeout_secon
 
 
 async def wait_for_mcp_startup(
-    client, thread_id, cwd, pane_id, timeout_seconds, startup_log_path
+    client, thread_id, cwd, reviewer, timeout_seconds, startup_log_path
 ):
-    """Return after this TUI-owned thread reports every MCP startup outcome."""
+    """Return after this reviewer's thread reports every MCP startup outcome."""
     deadline = time.monotonic() + timeout_seconds
-    if pane_id is not None and not pane_exists(pane_id):
-        raise RuntimeError("Codex TUI pane exited before MCP status was ready")
+    if reviewer_gone(reviewer):
+        raise RuntimeError(
+            f"{reviewer.description} exited before MCP status was ready"
+        )
     try:
         config_result = await asyncio.wait_for(
             client.request(
@@ -3179,12 +3464,15 @@ async def wait_for_mcp_startup(
         )
     except asyncio.TimeoutError as error:
         raise RuntimeError("Timed out reading Codex MCP startup configuration") from error
-    if pane_id is not None and not pane_exists(pane_id):
-        raise RuntimeError("Codex TUI pane exited before MCP status was ready")
+    if reviewer_gone(reviewer):
+        raise RuntimeError(
+            f"{reviewer.description} exited before MCP status was ready"
+        )
 
     # Codex 0.149.1's TUI defines its expected startup round from this same set
     # of enabled vendor servers. Require terminal notifications observed on
-    # that TUI's connection before placing the Axis Brief in its queue.
+    # the connection that loaded the thread — the TUI's, or the Bridge's own
+    # where no TUI is attached — before placing the Axis Brief in its queue.
     configured = (config_result.get("config") or {}).get("mcp_servers") or {}
     enabled_configured = {
         name
@@ -3202,10 +3490,16 @@ async def wait_for_mcp_startup(
         )
         if not unsettled:
             return {name: statuses[name] for name in sorted(enabled_configured)}
-        if pane_id is not None and not pane_exists(pane_id):
-            raise RuntimeError("Codex TUI pane exited before MCP status was ready")
+        if reviewer_gone(reviewer):
+            raise RuntimeError(
+                f"{reviewer.description} exited before MCP status was ready"
+            )
 
-        await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        pause = min(0.05, max(0.0, deadline - time.monotonic()))
+        if reviewer is None:
+            await asyncio.sleep(pause)
+        else:
+            await reviewer.listen(client, pause)
 
     raise RuntimeError(
         "Timed out waiting for Codex MCP startup (unsettled: "
@@ -3214,7 +3508,7 @@ async def wait_for_mcp_startup(
     )
 
 
-async def wait_for_review(client, thread_id, marker, pane_id, timeout_seconds):
+async def wait_for_review(client, thread_id, marker, reviewer, timeout_seconds):
     """Returns the (thread, turn) pair once the review turn reaches a terminal status."""
     deadline = time.monotonic() + timeout_seconds
     unreadable = None
@@ -3236,8 +3530,10 @@ async def wait_for_review(client, thread_id, marker, pane_id, timeout_seconds):
             if turn and turn.get("status") in TERMINAL_TURN_STATUSES:
                 return thread, turn
 
-        if not pane_exists(pane_id):
-            raise RuntimeError("Codex TUI pane exited before the review turn completed")
+        if reviewer_gone(reviewer):
+            raise RuntimeError(
+                f"{reviewer.description} exited before the review turn completed"
+            )
         await asyncio.sleep(0.5)
 
     raise RuntimeError(
@@ -3247,7 +3543,7 @@ async def wait_for_review(client, thread_id, marker, pane_id, timeout_seconds):
 
 
 async def queue_review(client, thread_id, prompt, marker, sent=None):
-    """Durably queue one Axis Brief on the TUI-owned thread."""
+    """Durably queue one Axis Brief on the reviewer's thread."""
     return await client.request(
         "thread/queue/add",
         {
@@ -3325,7 +3621,7 @@ def thread_has_active_turn(thread):
 
 
 async def ensure_review_delivery(
-    client, state, prompt, pane_id, timeout_seconds
+    client, state, prompt, reviewer, timeout_seconds
 ):
     """Recover one recorded delivery without ever submitting its Brief twice.
 
@@ -3336,8 +3632,10 @@ async def ensure_review_delivery(
     deadline = time.monotonic() + timeout_seconds
     unreadable = None
     while time.monotonic() < deadline:
-        if not pane_exists(pane_id):
-            raise RuntimeError("Codex TUI pane exited before delivery was confirmed")
+        if reviewer_gone(reviewer):
+            raise RuntimeError(
+                f"{reviewer.description} exited before delivery was confirmed"
+            )
         if await queued_review_present(
             client, state["threadId"], state["marker"]
         ):
@@ -3390,7 +3688,7 @@ def write_runtime_prompt(runtime_dir, prompt):
 
 
 def session_state(
-    session_id, owner, runtime_dir, pane_id, thread_id, target, model, effort,
+    session_id, owner, runtime_dir, reviewer, thread_id, target, model, effort,
     marker, axis, caller_arguments, resolved_arguments=(),
     model_source=SOURCE_VENDOR, effort_source=SOURCE_VENDOR,
 ):
@@ -3398,6 +3696,7 @@ def session_state(
     return {
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
+        RECORD_REVIEWER_FIELD: REVIEWER_CODEX,
         "axis": axis,
         NEXT_CALL_ARGUMENTS_FIELD: list(caller_arguments),
         NEXT_CALL_RESOLVED_FIELD: list(resolved_arguments),
@@ -3406,7 +3705,9 @@ def session_state(
         "owner": owner.to_dict(),
         "runtimeDir": str(runtime_dir),
         "socketPath": str(runtime_dir / "app-server.sock"),
-        "paneId": pane_id,
+        # How a recovering caller tells whether this reviewer is still there:
+        # its pane, or its headless app-server.
+        **reviewer.record_fields(),
         "threadId": thread_id,
         "target": target,
         "model": model,
@@ -3504,7 +3805,8 @@ class AxisLaunch:
     prompt: str
     marker: str
     runtime_dir: pathlib.Path
-    pane_id: str
+    #: The pane or headless app-server this axis's reviewer runs in.
+    reviewer: object
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3567,44 +3869,41 @@ def axis_arguments(args, axis):
     return axis_args
 
 
-def launch_axis(args, brief, tmux_target, split_direction):
+def launch_axis(args, brief, open_reviewer):
+    """Open one axis's reviewer; `open_reviewer` takes its arguments and runtime."""
     axis_args = axis_arguments(args, brief.axis)
-    axis_args.tmux_target = tmux_target
-    axis_args.split_direction = split_direction
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
     prompt = build_prompt(brief, bridge_id)
     runtime_dir = make_runtime(prompt)
     try:
-        pane_id = open_child_pane(axis_args, runtime_dir)
+        reviewer = open_reviewer(axis_args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
-    return AxisLaunch(axis_args, prompt, marker, runtime_dir, pane_id)
+    return AxisLaunch(axis_args, prompt, marker, runtime_dir, reviewer)
 
 
 async def drive_new_review(launch, owner, store):
     args = launch.args
     runtime_dir = launch.runtime_dir
-    pane_id = launch.pane_id
+    reviewer = launch.reviewer
     client = None
     state = None
     thread_id = None
     try:
         client = await connect_when_ready(
             runtime_dir / "app-server.sock",
-            pane_id,
+            reviewer,
             args.startup_timeout,
             runtime_dir / "app-server.log",
         )
-        thread_id = await wait_for_tui_thread(
-            client, None, pane_id, args.startup_timeout
-        )
+        thread_id = await reviewer.load_thread(client, args)
         await wait_for_mcp_startup(
             client,
             thread_id,
             args.cwd,
-            pane_id,
+            reviewer,
             args.startup_timeout,
             runtime_dir / MCP_STARTUP_LOG_FILENAME,
         )
@@ -3613,7 +3912,7 @@ async def drive_new_review(launch, owner, store):
             session_id,
             owner,
             runtime_dir,
-            pane_id,
+            reviewer,
             thread_id,
             args.base,
             args.model,
@@ -3626,7 +3925,7 @@ async def drive_new_review(launch, owner, store):
             getattr(args, "effort_source", SOURCE_VENDOR),
         )
         state["preparation"] = preparation_report(args)
-        # The TUI is already attached to an idle thread. The record goes down
+        # The reviewer's thread is loaded and idle. The record goes down
         # before the durable queue receives the Brief, so either side of a
         # killed driver remains discoverable without a second submission.
         await persist_and_queue_review(
@@ -3638,7 +3937,7 @@ async def drive_new_review(launch, owner, store):
             args.startup_timeout,
         )
         _thread, turn = await wait_for_review(
-            client, thread_id, launch.marker, pane_id, args.timeout
+            client, thread_id, launch.marker, reviewer, args.timeout
         )
     except Exception as error:
         reason = str(error) or type(error).__name__
@@ -3711,16 +4010,16 @@ def cost_from_report(report):
     return counters, report.get("resolvedModel"), report.get("costDetail")
 
 
-async def connect_existing_session(state):
+async def connect_existing_session(reviewer, socket_path):
+    """A client on a recorded reviewer still running, or `None` where it is gone."""
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        if not pane_exists(state["paneId"]) or not os.path.exists(
-            state["socketPath"]
-        ):
+        if not reviewer.alive() or not os.path.exists(socket_path):
             return None
-        client = AppServerClient(state["socketPath"])
         try:
-            return await client.__aenter__()
+            return await open_app_server_client(
+                socket_path, reviewer.notification_log
+            )
         except (OSError, aiohttp.ClientError, AppServerError):
             await asyncio.sleep(0.1)
     return None
@@ -3752,17 +4051,16 @@ class BriefDelivery:
         self.arrived = False
 
 
-async def resume_session_in_new_pane(
-    args, owner, store, state, prompt, marker, delivery
+async def resume_session_in_new_reviewer(
+    args, owner, store, state, prompt, marker, delivery, reviewer_type
 ):
-    close_pane(state["paneId"])
-    shutil.rmtree(state["runtimeDir"], ignore_errors=True)
+    """Put the follow-up to a new reviewer of `reviewer_type` on the same thread."""
+    reviewer_type.from_record(state).stop(state["runtimeDir"])
 
     runtime_dir = make_runtime(prompt)
-    args.tmux_target = owner.origin_pane
     args.resume_thread_id = state["threadId"]
     try:
-        pane_id = open_child_pane(args, runtime_dir)
+        reviewer = reviewer_type.open(args, runtime_dir, owner)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
@@ -3771,26 +4069,24 @@ async def resume_session_in_new_pane(
     try:
         client = await connect_when_ready(
             runtime_dir / "app-server.sock",
-            pane_id,
+            reviewer,
             args.startup_timeout,
             runtime_dir / "app-server.log",
         )
-        await wait_for_tui_thread(
-            client, state["threadId"], pane_id, args.startup_timeout
-        )
+        await reviewer.load_thread(client, args, state["threadId"])
         await wait_for_mcp_startup(
             client,
             state["threadId"],
             args.cwd,
-            pane_id,
+            reviewer,
             args.startup_timeout,
             runtime_dir / MCP_STARTUP_LOG_FILENAME,
         )
-        # The record names the TUI-owned pane before its durable queue receives
+        # The record names the new reviewer before its durable queue receives
         # the follow-up, so recovery can distinguish and complete either gap.
         state["runtimeDir"] = str(runtime_dir)
         state["socketPath"] = str(runtime_dir / "app-server.sock")
-        state["paneId"] = pane_id
+        state.update(reviewer.record_fields())
         state["updatedAt"] = time.time()
         await persist_and_queue_review(
             client, store, state, prompt, marker, args.startup_timeout, delivery
@@ -3799,26 +4095,26 @@ async def resume_session_in_new_pane(
             client,
             state["threadId"],
             marker,
-            pane_id,
+            reviewer,
             args.timeout,
         )
     except Exception:
         # A returned timeout is an ordinary failed round, so #26 requires its
-        # pane to settle. A killed driver raises outside Exception and leaves
-        # the same pane/runtime intact for --recover-session.
-        cleanup_pane(pane_id, runtime_dir)
+        # reviewer to settle. A killed driver raises outside Exception and
+        # leaves the same reviewer/runtime intact for --recover-session.
+        reviewer.stop(runtime_dir)
         raise
     finally:
         if client is not None:
             await client.__aexit__(None, None, None)
 
 
-async def run_existing_review(args, brief, owner, store):
+async def run_existing_review(args, brief, owner, store, reviewer_type):
     state = args.resume_state
     if state is None:
         state = store.read(args.resume_session)
     validate_resume_axis(args, state)
-    validate_session_owner(state, owner)
+    validate_session_owner(state, owner, REVIEWER_CODEX)
     apply_session_model_choice(args, state)
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
@@ -3830,10 +4126,12 @@ async def run_existing_review(args, brief, owner, store):
     delivery = BriefDelivery()
 
     try:
-        client = await connect_existing_session(state)
+        reviewer = reviewer_type.from_record(state)
+        client = await connect_existing_session(reviewer, state["socketPath"])
         if client is None:
-            _thread, turn = await resume_session_in_new_pane(
-                args, owner, store, state, prompt, marker, delivery
+            _thread, turn = await resume_session_in_new_reviewer(
+                args, owner, store, state, prompt, marker, delivery,
+                reviewer_type,
             )
         else:
             try:
@@ -3851,7 +4149,7 @@ async def run_existing_review(args, brief, owner, store):
                     client,
                     state["threadId"],
                     marker,
-                    state["paneId"],
+                    reviewer,
                     args.timeout,
                 )
             finally:
@@ -3866,7 +4164,7 @@ async def run_existing_review(args, brief, owner, store):
     return AxisCompleted(state, turn)
 
 
-async def run_recovered_reviews(args, owner, store):
+async def run_recovered_reviews(args, owner, store, reviewer_type):
     """Recover every live reviewer or undelivered report this owner has.
 
     Returns each completed or failed axis for the sessions this owner already owns.
@@ -3883,7 +4181,8 @@ async def run_recovered_reviews(args, owner, store):
             return StoredAxisRun(state)
         if any(not state.get(field) for field in CodexLane.RECOVERABLE_FIELDS):
             return None
-        client = await connect_existing_session(state)
+        reviewer = reviewer_type.from_record(state)
+        client = await connect_existing_session(reviewer, state["socketPath"])
         if client is None:
             return None
         try:
@@ -3895,14 +4194,14 @@ async def run_recovered_reviews(args, owner, store):
                     client,
                     state,
                     prompt,
-                    state["paneId"],
+                    reviewer,
                     args.startup_timeout,
                 )
                 _thread, turn = await wait_for_review(
                     client,
                     state["threadId"],
                     state["marker"],
-                    state["paneId"],
+                    reviewer,
                     args.timeout,
                 )
             except Exception as error:
@@ -3918,15 +4217,16 @@ async def run_recovered_reviews(args, owner, store):
     recovered = await asyncio.gather(
         *(
             recover(state)
-            for state in store.find_by_owner(owner)
+            for state in store.find_by_owner(owner, REVIEWER_CODEX)
         )
     )
     recoverable = [run for run in recovered if run is not None]
     if recoverable:
         return {run.state["axis"]: run for run in recoverable}
     raise NoLiveSessionError(
-        "No live review session for this tmux pane and worktree. "
-        "Nothing to recover; start a review instead."
+        "No live review session for this "
+        + ("tmux pane and worktree" if owner.origin_pane else "worktree")
+        + ". Nothing to recover; start a review instead."
     )
 
 
@@ -3940,8 +4240,10 @@ class Lane:
     review was prepared from — is here; what only one vendor does is not.
     """
 
-    #: Whether this Lane's reviewer runs in a tmux pane of the caller's server.
-    NEEDS_TMUX = False
+    #: Whether this Lane's reviewer can be shown in a tmux pane. The Bridge
+    #: opens one only where the call also has a window; otherwise the
+    #: reviewer runs headless.
+    SUPPORTS_PANE = False
     #: What an axis that reached no reviewer of its own spent, which is nothing
     #: readable. Each Lane names the reason its own reviewer could not be read.
     NO_COST = (None, None, "this axis reached no reviewer to read a cost from")
@@ -4060,61 +4362,71 @@ class Lane:
 
 
 class CodexLane(Lane):
-    """Delivery to the codex reviewer: one Codex TUI pane per axis.
+    """Delivery to the codex reviewer: one app-server and thread per axis.
 
-    Everything that is codex's rather than the review's — panes, threads,
-    app-server connections, the record on disk — lives on this side of the seam.
+    Each axis's reviewer runs in a Codex TUI pane where the Bridge gave this
+    Lane a window, and as a headless app-server where it did not. Everything
+    after the thread is loaded is the same either way. Everything that is
+    codex's rather than the review's — panes, app-servers, threads, the record
+    on disk — lives on this side of the seam.
     """
 
     name = REVIEWER_CODEX
-    NEEDS_TMUX = True
+    SUPPORTS_PANE = True
     NO_COST = (None, None, NO_THREAD_DETAIL)
     #: What a record must carry for a recovering caller to find its turn again.
     RECOVERABLE_FIELDS = ("marker", "threadId")
 
     def __init__(self, args, owner, store):
         super().__init__(args, owner, store)
+        # The owner carries a pane only where the Bridge found a window.
+        self.reviewer_type = CodexPane if owner.origin_pane else CodexAppServer
         # Pane layout: the first axis splits off the caller's own pane to its
         # right, and each further axis splits off the one before it, downwards.
-        self.previous_pane = None
+        self.previous = None
 
     def open(self, brief):
-        """Open one axis's pane, ready to be driven."""
-        launch = launch_axis(
-            self.args,
-            brief,
-            self.previous_pane or self.owner.origin_pane,
-            "vertical" if self.previous_pane else "horizontal",
-        )
-        self.previous_pane = launch.pane_id
+        """Open one axis's reviewer, ready to be driven."""
+        launch = launch_axis(self.args, brief, self.open_reviewer)
+        self.previous = launch.reviewer
         return launch
+
+    def open_reviewer(self, axis_args, runtime_dir):
+        return self.reviewer_type.open(
+            axis_args, runtime_dir, self.owner, self.previous
+        )
 
     def discard(self, launch):
         """Tear down an axis that opened but will never be driven."""
-        cleanup_pane(launch.pane_id, launch.runtime_dir)
+        launch.reviewer.stop(launch.runtime_dir)
 
     async def deliver(self, launch):
         """Drive one opened axis to a result of its own."""
         run = await drive_terminal_axis(launch, self.owner, self.store)
         self.settle_result(run)
-        cleanup_pane(launch.pane_id, launch.runtime_dir)
+        launch.reviewer.stop(launch.runtime_dir)
         return run
 
     async def resume(self, brief):
         """Put one more turn to the lineage a resume handle names."""
-        return await run_existing_review(self.args, brief, self.owner, self.store)
+        return await run_existing_review(
+            self.args, brief, self.owner, self.store, self.reviewer_type
+        )
 
     async def recover(self):
         """Recover every live reviewer or undelivered report this owner has."""
-        return await run_recovered_reviews(self.args, self.owner, self.store)
+        return await run_recovered_reviews(
+            self.args, self.owner, self.store, self.reviewer_type
+        )
 
     def settle(self, run):
-        """Close one axis out: its record written, its pane down, its result returned."""
+        """Close one axis out: its record written, its reviewer down, its result returned."""
         result = self.settle_result(run)
-        if self.args.recover_session or self.args.resume_session:
-            cleanup_pane(
-                run.state.get("paneId") if run.state else None,
-                run.state.get("runtimeDir") if run.state else None,
+        if (
+            self.args.recover_session or self.args.resume_session
+        ) and run.state is not None:
+            self.reviewer_type.from_record(run.state).stop(
+                run.state.get("runtimeDir")
             )
         return result
 
@@ -4423,6 +4735,7 @@ def headless_session_state(
     return {
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
+        RECORD_REVIEWER_FIELD: REVIEWER_CLAUDE,
         "axis": axis,
         NEXT_CALL_ARGUMENTS_FIELD: list(caller_arguments),
         NEXT_CALL_RESOLVED_FIELD: list(resolved_arguments),
@@ -4614,7 +4927,7 @@ class ClaudeLane(Lane):
         delivery = BriefDelivery()
         try:
             validate_resume_axis(self.args, state)
-            validate_session_owner(state, self.owner)
+            validate_session_owner(state, self.owner, self.name)
             apply_session_model_choice(self.args, state)
             launch = self.launch(
                 axis_arguments(self.args, state["axis"]),
@@ -4660,7 +4973,7 @@ class ClaudeLane(Lane):
         """
         return [
             state
-            for state in self.store.find_by_owner(self.owner)
+            for state in self.store.find_by_owner(self.owner, self.name)
             if undelivered_report(state) is not None
             or (
                 all(state.get(field) for field in self.RECOVERABLE_FIELDS)
@@ -4751,8 +5064,8 @@ def resolve_lane(args, store):
     """The Lane this call named, under the owner identity it runs as.
 
     Both are resolved before any of the Lane opens, so a reviewer there is no
-    Lane for, and a Lane whose dependencies this caller has not got, are each
-    refused by name rather than part way through a review.
+    Lane for is refused by name rather than part way through a review. The
+    owner also carries whether this call's reviewers open in a pane.
     """
     lane = LANES.get(args.reviewer)
     if lane is None:

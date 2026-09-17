@@ -253,18 +253,26 @@ MARKER_PATTERN = re.compile(r"\[claude-tui-review-bridge:[^\]]+\]")
 
 
 class FakeCodexAxis:
-    """One fake pane/app-server pair in the multi-pane harness."""
+    """One fake app-server in the harness, behind a pane or running headless.
+
+    A headless one has no pane id; it is named by its app-server's pid instead,
+    and the Bridge rather than a TUI starts or resumes its thread.
+    """
 
     def __init__(
         self, owner, axis, pane_id, socket_path, model=None, effort=None,
-        resume_thread_id=None,
+        resume_thread_id=None, app_server_pid=None,
     ):
         self.owner = owner
         self.axis = axis
         self.pane_id = pane_id
+        self.app_server_pid = app_server_pid
         self.socket_path = str(socket_path)
-        self.thread_id = f"thread-{axis}-{pane_id.lstrip('%')}"
-        self.turn_id = f"turn-{axis}-{pane_id.lstrip('%')}"
+        label = (
+            pane_id.lstrip("%") if pane_id is not None else f"pid{app_server_pid}"
+        )
+        self.thread_id = f"thread-{axis}-{label}"
+        self.turn_id = f"turn-{axis}-{label}"
         self.model = model
         self.effort = effort
         self.resume_thread_id = resume_thread_id
@@ -352,11 +360,16 @@ class FakeCodexAxis:
             error = self.owner.thread_start_errors.get(self.axis)
             if error is not None:
                 raise RuntimeError(error)
+            self.owner.thread_starts.append(params)
+            # Codex announces a new thread's MCP startup on the connection
+            # that started it.
+            self.owner.record_mcp_startup(self)
             return {"thread": {"id": self.thread_id}}
         if method == "thread/resume":
             self.owner.resumed_threads.append(params["threadId"])
             self.thread_id = params["threadId"]
-            return {}
+            self.owner.record_mcp_startup(self)
+            return {"thread": {"id": self.thread_id}}
         if method == "thread/read":
             error = self.owner.axis_errors.get(self.axis)
             if error is not None:
@@ -391,6 +404,8 @@ class FakeCodexAxis:
                 effective["effort"] = self.effort
             self.record_turn(effective)
             self.queued.remove(submission)
+            if self.axis in self.owner.brief_exits:
+                self.owner.live_app_servers.discard(self.app_server_pid)
             if self.owner.queue_add_exit_after_accept is not None:
                 raise self.owner.queue_add_exit_after_accept
             return {"queuedSubmission": submission}
@@ -431,6 +446,17 @@ class FakeCodexSession:
         self.queue_send_errors = {}
         self.queue_reply_errors = {}
         self.concurrent_turn_count = 0
+        # Headless delivery: every app-server launched, by pid, and which of
+        # them are still running.
+        self.app_servers = []
+        self.app_server_launches = []
+        self.app_server_runtime_dirs = []
+        self.live_app_servers = set()
+        self.stopped_app_servers = []
+        self.app_server_launch_errors = {}
+        self.startup_exits = {}
+        self.brief_exits = set()
+        self.thread_starts = []
 
     def record_mcp_startup(self, session):
         if hasattr(self.bridge, "record_mcp_startup_notification"):
@@ -501,6 +527,51 @@ class FakeCodexSession:
             (axis, args.tmux_target, getattr(args, "split_direction", "horizontal"))
         )
         return pane_id
+
+    def launch_app_server(self, args, runtime_dir):
+        error = self.app_server_launch_errors.pop(args.axis, None)
+        if error is not None:
+            raise RuntimeError(error)
+        runtime_dir = pathlib.Path(runtime_dir)
+        socket_path = runtime_dir / "app-server.sock"
+        socket_path.touch()
+        pid = 7000 + len(self.app_servers)
+        self.app_servers.append(pid)
+        self.app_server_launches.append((args.axis, args))
+        self.app_server_runtime_dirs.append(runtime_dir)
+        self.live_app_servers.add(pid)
+        said = self.startup_exits.pop(args.axis, None)
+        if said is not None:
+            (runtime_dir / "app-server.log").write_text(said, encoding="utf-8")
+            self.live_app_servers.discard(pid)
+        self.sessions[str(socket_path)] = FakeCodexAxis(
+            self,
+            args.axis,
+            None,
+            socket_path,
+            getattr(args, "model", None),
+            getattr(args, "effort", None),
+            app_server_pid=pid,
+        )
+        return argparse.Namespace(pid=pid)
+
+    def app_server_alive(self, pid, _socket_path):
+        return pid in self.live_app_servers
+
+    def stop_app_server(self, pid, _socket_path):
+        self.stopped_app_servers.append(pid)
+        self.live_app_servers.discard(pid)
+
+    def fail_app_server_launch(self, axis, reason):
+        self.app_server_launch_errors[axis] = reason
+
+    def exit_on_launch(self, axis, said):
+        """Have an app-server exit as it starts, leaving `said` in its log."""
+        self.startup_exits[axis] = said
+
+    def exit_after_brief(self, axis):
+        """Have an app-server die once its Brief is queued, mid-turn."""
+        self.brief_exits.add(axis)
 
     def close_pane(self, pane_id):
         if pane_id in self.panes:
@@ -807,10 +878,18 @@ class FakePaneTestCase(unittest.TestCase):
             side_effect=self.codex.close_pane,
         ))
         self.enter(mock.patch.object(
-            self.bridge, "connect_when_ready", self.connect
+            self.bridge, "open_app_server_client", self.connect
         ))
         self.enter(mock.patch.object(
-            self.bridge, "connect_existing_session", self.connect_existing
+            self.bridge, "launch_app_server", self.codex.launch_app_server
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "app_server_alive",
+            side_effect=self.codex.app_server_alive,
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "terminate_app_server",
+            side_effect=self.codex.stop_app_server,
         ))
         self.enter(mock.patch.object(
             self.bridge,
@@ -852,10 +931,31 @@ class FakePaneTestCase(unittest.TestCase):
     async def connect(self, socket_path, *_args, **_kwargs):
         return self.codex.client(socket_path)
 
-    async def connect_existing(self, state):
-        if state["paneId"] not in self.codex.panes:
-            return None
-        return self.codex.client(state["socketPath"])
+    def without_tmux(self):
+        """Run the rest of this test from a terminal with no tmux window."""
+        self.set_window(None, None)
+
+    def with_tmux(self, pane=ORIGIN_PANE):
+        """Run the rest of this test inside tmux, from `pane` if it names one."""
+        self.set_window(self.TMUX, pane)
+
+    def set_window(self, tmux, pane):
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name not in ("TMUX", "TMUX_PANE")
+        }
+        if tmux:
+            environment["TMUX"] = tmux
+        if pane:
+            environment["TMUX_PANE"] = pane
+        self.enter(mock.patch.dict(os.environ, environment, clear=True))
+
+    def assert_no_reviewer_left(self):
+        """Every headless app-server is stopped, and its runtime is gone."""
+        self.assertEqual(self.codex.live_app_servers, set())
+        for runtime_dir in self.codex.app_server_runtime_dirs:
+            self.assertFalse(runtime_dir.exists(), runtime_dir)
 
     def args(self, **overrides):
         values = {

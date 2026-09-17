@@ -50,7 +50,7 @@ class RecoveryRecordTests(unittest.TestCase):
             )
 
             self.assertEqual(self.bridge.SESSION_STATE_VERSION, 2)
-            self.assertEqual(store.find_by_owner(owner), [])
+            self.assertEqual(store.find_by_owner(owner, "codex"), [])
 
 
 class BufferedOutput(io.StringIO):

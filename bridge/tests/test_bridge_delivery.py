@@ -77,7 +77,7 @@ class DeliveryContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "belongs to another"):
             self.bridge.validate_session_owner(
-                {"owner": expected.to_dict()}, actual
+                {"owner": expected.to_dict()}, actual, "codex"
             )
 
     def test_launch_pane_requires_an_explicit_origin_target(self):
@@ -194,6 +194,98 @@ class DeliveryContractTests(unittest.TestCase):
         )
         self.assertNotIn("resume", command)
         self.assertNotIn("Review HEAD", command)
+
+    def test_a_headless_app_server_runs_as_a_panes_would_in_a_session_of_its_own(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_dir = pathlib.Path(temp_dir)
+            args = base_args(
+                cwd=temp_dir, network=True, model="gpt-x", effort="high"
+            )
+            with mock.patch.object(self.bridge.subprocess, "Popen") as popen:
+                self.bridge.launch_app_server(args, runtime_dir)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command,
+            self.bridge.app_server_command(args, runtime_dir / "app-server.sock"),
+        )
+        self.assertIn("sandbox_workspace_write.network_access=true", command)
+        self.assertIn('model="gpt-x"', command)
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertEqual(popen.call_args.kwargs["cwd"], temp_dir)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_a_headless_app_server_that_cannot_launch_says_why(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                self.bridge.subprocess,
+                "Popen",
+                side_effect=FileNotFoundError("codex"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Cannot launch a headless Codex app-server"
+                ):
+                    self.bridge.launch_app_server(
+                        base_args(cwd=temp_dir), pathlib.Path(temp_dir)
+                    )
+
+    def test_a_recorded_app_server_pid_that_now_names_another_process_is_left_alone(self):
+        socket_path = "/tmp/claude-codex-tui-x/app-server.sock"
+        with mock.patch.object(
+            self.bridge, "process_command", return_value="/usr/sbin/unrelated -d"
+        ), mock.patch.object(
+            self.bridge, "process_exists", return_value=True
+        ), mock.patch.object(self.bridge.os, "killpg") as killpg:
+            alive = self.bridge.app_server_alive(424242, socket_path)
+            self.bridge.terminate_app_server(424242, socket_path)
+
+        self.assertFalse(alive)
+        killpg.assert_not_called()
+
+    def test_a_recorded_app_server_still_on_its_socket_is_stopped(self):
+        socket_path = "/tmp/claude-codex-tui-x/app-server.sock"
+        running = [True]
+
+        def killpg(_pid, sig):
+            running[0] = False
+
+        with mock.patch.object(
+            self.bridge,
+            "process_command",
+            side_effect=lambda _pid: (
+                f"codex app-server --listen unix://{socket_path}"
+                if running[0] else ""
+            ),
+        ), mock.patch.object(
+            self.bridge, "process_exists", return_value=True
+        ), mock.patch.object(
+            self.bridge.os, "killpg", side_effect=killpg
+        ) as signalled:
+            self.assertTrue(self.bridge.app_server_alive(424242, socket_path))
+            self.bridge.terminate_app_server(424242, socket_path)
+
+        signalled.assert_called_once_with(424242, self.bridge.signal.SIGTERM)
+
+    def test_a_caller_that_may_not_run_ps_still_sees_and_stops_its_app_server(self):
+        socket_path = "/tmp/claude-codex-tui-x/app-server.sock"
+        running = [True]
+
+        def killpg(_pid, _sig):
+            running[0] = False
+
+        with mock.patch.object(
+            self.bridge.subprocess,
+            "run",
+            side_effect=PermissionError(1, "Operation not permitted", "ps"),
+        ), mock.patch.object(
+            self.bridge, "process_exists", side_effect=lambda _pid: running[0]
+        ), mock.patch.object(
+            self.bridge.os, "killpg", side_effect=killpg
+        ) as signalled:
+            self.assertTrue(self.bridge.app_server_alive(424242, socket_path))
+            self.bridge.terminate_app_server(424242, socket_path)
+
+        signalled.assert_called_once_with(424242, self.bridge.signal.SIGTERM)
 
     def test_pane_starts_the_observing_proxy_before_the_tui(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -419,7 +511,7 @@ class RecordingLane:
     """
 
     instances = []
-    NEEDS_TMUX = True
+    SUPPORTS_PANE = True
 
     def __init__(self, args, owner, store):
         self.args = args

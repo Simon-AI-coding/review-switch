@@ -230,10 +230,14 @@ This fallback does not change Document Review or coordinator-owned policy.
 Both Lanes need Python 3.11+ with `aiohttp` (`pip install aiohttp`) installed for the interpreter
 that runs `review-bridge`, and `git`.
 
-- **codex Lane** — the `codex` CLI, and `tmux`: each axis is an interactive TUI lineage in a pane
-  of its own. The TUI creates or resumes an idle thread; the Bridge observes that thread's MCP
-  startup on the same TUI connection, records recovery state, and queues the Axis Brief only after
-  startup settles. The pane is torn down when the turn ends and the lineage is left resumable.
+- **codex Lane** — the `codex` CLI. `tmux` is needed only to show the reviewer: run from inside
+  tmux, each axis is an interactive TUI lineage in a pane of its own, and the TUI creates or
+  resumes an idle thread; run from a plain terminal, each axis is a headless `codex app-server`,
+  and the Bridge starts or resumes the thread itself. Either way the Bridge observes that thread's
+  MCP startup, records recovery state, and queues the Axis Brief only after startup settles. The
+  pane or app-server is stopped when the turn ends and the lineage is left resumable. The command
+  and its result are the same in both; a review is recovered or resumed from the same kind of
+  terminal it started in.
 - **claude Lane** — the `claude` CLI. Each axis is a headless process, and no tmux is involved.
 
 `code-review-graph` is optional on either Lane: when its CLI is available, the Bridge adds

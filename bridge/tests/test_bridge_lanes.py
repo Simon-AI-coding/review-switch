@@ -271,15 +271,7 @@ class ClaudeDeliveryTests(FakePaneTestCase):
 
 
 class LaneDependencyTests(FakePaneTestCase):
-    """Which Lane needs a terminal multiplexer and which does not."""
-
-    def without_tmux(self):
-        environment = {
-            name: value
-            for name, value in os.environ.items()
-            if name not in ("TMUX", "TMUX_PANE")
-        }
-        self.enter(mock.patch.dict(os.environ, environment, clear=True))
+    """No Lane needs a terminal multiplexer; tmux only decides where one shows."""
 
     def test_the_claude_lane_reviews_with_no_tmux_at_all(self):
         self.without_tmux()
@@ -290,13 +282,14 @@ class LaneDependencyTests(FakePaneTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output["axes"]["standards"]["finalMessage"], "no findings")
 
-    def test_the_codex_lane_still_refuses_to_run_outside_tmux(self):
+    def test_the_codex_lane_reviews_with_no_tmux_at_all(self):
         self.without_tmux()
         self.codex.finish("no findings")
 
-        with self.assertRaisesRegex(RuntimeError, "tmux"):
-            self.run_bridge(self.args(reviewer="codex"))
+        code, output = self.run_bridge(self.args(reviewer="codex"))
 
+        self.assertEqual(code, 0)
+        self.assertEqual(output["axes"]["standards"]["finalMessage"], "no findings")
         self.assertEqual(self.codex.launched_panes, [])
 
     def test_the_two_lanes_never_own_each_others_records(self):
